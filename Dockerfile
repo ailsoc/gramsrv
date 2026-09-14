@@ -7,6 +7,7 @@
 ARG GO_IMAGE=registry.access.redhat.com/ubi9/go-toolset:1.26
 ARG RUNTIME_IMAGE=registry.access.redhat.com/ubi9/ubi-minimal:latest
 
+
 ###############################################################################
 # Builder Base
 ###############################################################################
@@ -16,18 +17,49 @@ FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS build-base
 ARG TARGETOS
 ARG TARGETARCH
 
+USER 0
+
+# Build artifacts and temporary build data.
+#
+# The Go Toolset image runs builds as a non-root user. These directories are
+# therefore prepared by root and made writable for the build user.
+RUN mkdir -p \
+        /out \
+        /tmp/go-build \
+    && chgrp -R 0 \
+        /out \
+        /tmp/go-build \
+    && chmod -R g=u \
+        /out \
+        /tmp/go-build
+
 WORKDIR /src
+
+###############################################################################
+# Go dependency layer
+###############################################################################
 
 COPY go.mod go.sum ./
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download
 
+###############################################################################
+# Source
+###############################################################################
+
 COPY cmd/ ./cmd/
 COPY deploy/ ./deploy/
 COPY internal/ ./internal/
 
 ENV CGO_ENABLED=0
+
+# UBI Go Toolset non-root user.
+#
+# OpenShift compatibility:
+# the final runtime images do not rely on a fixed UID.
+USER 1001
+
 
 ###############################################################################
 # Healthcheck
@@ -45,6 +77,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -o /out/telesrv-healthcheck \
       ./cmd/telesrv-healthcheck
 
+
 ###############################################################################
 # Migration
 ###############################################################################
@@ -61,8 +94,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -o /out/telesrv-migrate \
       ./cmd/telesrv-migrate
 
+
 ###############################################################################
-# Build Functions
+# CORE
 ###############################################################################
 
 FROM build-base AS build-core
@@ -86,6 +120,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -o /out/telesrv-core \
       ./cmd/telesrv-core
 
+
+###############################################################################
+# EDGE
 ###############################################################################
 
 FROM build-base AS build-edge
@@ -109,6 +146,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -o /out/telesrv-edge \
       ./cmd/telesrv-edge
 
+
+###############################################################################
+# EGRESS
 ###############################################################################
 
 FROM build-base AS build-egress
@@ -132,6 +172,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -o /out/telesrv-egress \
       ./cmd/telesrv-egress
 
+
+###############################################################################
+# FILE
 ###############################################################################
 
 FROM build-base AS build-file
@@ -155,6 +198,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -o /out/telesrv-file \
       ./cmd/telesrv-file
 
+
+###############################################################################
+# SFU
 ###############################################################################
 
 FROM build-base AS build-sfu
@@ -178,23 +224,33 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -o /out/telesrv-sfu \
       ./cmd/telesrv-sfu
 
+
 ###############################################################################
-# Admin UI
+# ADMIN UI
 ###############################################################################
 
 FROM build-base AS build-admin
 
-USER root
+USER 0
 
-RUN dnf install -y nodejs npm \
- && dnf clean all
+RUN dnf install -y \
+        nodejs \
+        npm \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
 
 WORKDIR /src/cmd/telesrv-admin/web
 
 RUN --mount=type=cache,target=/root/.npm \
-    npm ci && npm run build
+    npm ci \
+    && npm run build
 
 WORKDIR /src
+
+RUN chgrp -R 0 /src/cmd/telesrv-admin/web \
+    && chmod -R g=u /src/cmd/telesrv-admin/web
+
+USER 1001
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/tmp/go-build \
@@ -205,6 +261,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -ldflags="-s -w" \
       -o /out/telesrv-admin \
       ./cmd/telesrv-admin
+
 
 ###############################################################################
 # Language Bundle
@@ -220,8 +277,13 @@ RUN set -eux; \
     find . -type f -name '*.strings' | sort > /tmp/langpack-files; \
     test -s /tmp/langpack-files; \
     while read -r f; do sha256sum "$f"; done < /tmp/langpack-files \
-      | sha256sum | cut -d ' ' -f1 \
+      | sha256sum \
+      | cut -d ' ' -f1 \
       > .seed-fingerprint
+
+RUN chgrp -R 0 /usr/share/telesrv/langpack \
+    && chmod -R g=u /usr/share/telesrv/langpack
+
 
 ###############################################################################
 # Runtime Base
@@ -232,59 +294,85 @@ FROM ${RUNTIME_IMAGE} AS runtime-base
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 
-LABEL org.opencontainers.image.title="telesrv" \
-      org.opencontainers.image.description="Telegram-like MTProto server" \
-      org.opencontainers.image.source="https://github.com/iamxvbaba/gramsrv" \
-      org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.created="${BUILD_DATE}"
+LABEL \
+    org.opencontainers.image.title="telesrv" \
+    org.opencontainers.image.description="Telegram-like MTProto server" \
+    org.opencontainers.image.source="https://github.com/iamxvbaba/gramsrv" \
+    org.opencontainers.image.revision="${VCS_REF}" \
+    org.opencontainers.image.created="${BUILD_DATE}"
+
+###############################################################################
+# Runtime dependencies
+###############################################################################
+
+USER 0
 
 RUN microdnf install -y \
         ca-certificates \
         tzdata \
-    && microdnf clean all
+    && microdnf clean all \
+    && rm -rf /var/cache/yum
+
+###############################################################################
+# Application directories
+###############################################################################
 
 ENV APP_ROOT=/opt/telesrv
 
 RUN mkdir -p \
-      ${APP_ROOT} \
-      /etc/telesrv \
-      /var/lib/telesrv \
-      /usr/share/telesrv \
-      /var/tmp/telesrv
-
-RUN chgrp -R 0 \
         ${APP_ROOT} \
         /etc/telesrv \
         /var/lib/telesrv \
         /usr/share/telesrv \
         /var/tmp/telesrv \
- && chmod -R g=u \
+    && chgrp -R 0 \
+        ${APP_ROOT} \
+        /etc/telesrv \
+        /var/lib/telesrv \
+        /usr/share/telesrv \
+        /var/tmp/telesrv \
+    && chmod -R g=u \
         ${APP_ROOT} \
         /etc/telesrv \
         /var/lib/telesrv \
         /usr/share/telesrv \
         /var/tmp/telesrv
 
+###############################################################################
+# Healthcheck
+###############################################################################
+
 COPY --from=build-healthcheck \
-  /out/telesrv-healthcheck \
-  /usr/local/bin/
+    /out/telesrv-healthcheck \
+    /usr/local/bin/telesrv-healthcheck
 
 COPY deploy/docker/docker-entrypoint.sh \
-  /usr/local/bin/telesrv-container-entrypoint
+    /usr/local/bin/telesrv-container-entrypoint
 
-RUN chmod 0555 \
-      /usr/local/bin/telesrv-healthcheck \
-      /usr/local/bin/telesrv-container-entrypoint
+RUN chgrp 0 \
+        /usr/local/bin/telesrv-healthcheck \
+        /usr/local/bin/telesrv-container-entrypoint \
+    && chmod 0555 \
+        /usr/local/bin/telesrv-healthcheck \
+        /usr/local/bin/telesrv-container-entrypoint
 
 WORKDIR ${APP_ROOT}
 
-HEALTHCHECK --interval=30s --timeout=5s \
-  --start-period=30s --retries=3 \
-  CMD ["/usr/local/bin/telesrv-healthcheck"]
+###############################################################################
+# OpenShift / Kubernetes security model
+###############################################################################
 
 USER 1001
 
+HEALTHCHECK \
+    --interval=30s \
+    --timeout=5s \
+    --start-period=30s \
+    --retries=3 \
+    CMD ["/usr/local/bin/telesrv-healthcheck"]
+
 ENTRYPOINT ["/usr/local/bin/telesrv-container-entrypoint"]
+
 
 ###############################################################################
 # CORE
@@ -293,22 +381,26 @@ ENTRYPOINT ["/usr/local/bin/telesrv-container-entrypoint"]
 FROM runtime-base AS core
 
 COPY --from=build-core \
-     /out/telesrv-core \
-     /usr/local/bin/
+    /out/telesrv-core \
+    /usr/local/bin/telesrv-core
 
 COPY --from=langpack-bundle \
-     /usr/share/telesrv/langpack \
-     /usr/share/telesrv/langpack
+    /usr/share/telesrv/langpack \
+    /usr/share/telesrv/langpack
 
 COPY deploy/docker/assets/seed-manifest.json \
-     /usr/share/telesrv/seed-manifest.json
+    /usr/share/telesrv/seed-manifest.json
 
 COPY deploy/docker/config/core.yaml \
-     /etc/telesrv/core.yaml
+    /etc/telesrv/core.yaml
+
+RUN chmod 0555 /usr/local/bin/telesrv-core \
+    && chgrp 0 /usr/local/bin/telesrv-core
 
 EXPOSE 2400 2401 2420 2440
 
-CMD ["telesrv-core","--config","/etc/telesrv/core.yaml"]
+CMD ["telesrv-core", "--config", "/etc/telesrv/core.yaml"]
+
 
 ###############################################################################
 # FILE
@@ -317,15 +409,19 @@ CMD ["telesrv-core","--config","/etc/telesrv/core.yaml"]
 FROM runtime-base AS file
 
 COPY --from=build-file \
-     /out/telesrv-file \
-     /usr/local/bin/
+    /out/telesrv-file \
+    /usr/local/bin/telesrv-file
 
 COPY deploy/docker/config/file.yaml \
-     /etc/telesrv/file.yaml
+    /etc/telesrv/file.yaml
+
+RUN chmod 0555 /usr/local/bin/telesrv-file \
+    && chgrp 0 /usr/local/bin/telesrv-file
 
 EXPOSE 2520
 
-CMD ["telesrv-file","--config","/etc/telesrv/file.yaml"]
+CMD ["telesrv-file", "--config", "/etc/telesrv/file.yaml"]
+
 
 ###############################################################################
 # EGRESS
@@ -334,15 +430,19 @@ CMD ["telesrv-file","--config","/etc/telesrv/file.yaml"]
 FROM runtime-base AS egress
 
 COPY --from=build-egress \
-     /out/telesrv-egress \
-     /usr/local/bin/
+    /out/telesrv-egress \
+    /usr/local/bin/telesrv-egress
 
 COPY deploy/docker/config/egress.yaml \
-     /etc/telesrv/egress.yaml
+    /etc/telesrv/egress.yaml
+
+RUN chmod 0555 /usr/local/bin/telesrv-egress \
+    && chgrp 0 /usr/local/bin/telesrv-egress
 
 EXPOSE 2510
 
-CMD ["telesrv-egress","--config","/etc/telesrv/egress.yaml"]
+CMD ["telesrv-egress", "--config", "/etc/telesrv/egress.yaml"]
+
 
 ###############################################################################
 # SFU
@@ -351,17 +451,21 @@ CMD ["telesrv-egress","--config","/etc/telesrv/egress.yaml"]
 FROM runtime-base AS sfu
 
 COPY --from=build-sfu \
-     /out/telesrv-sfu \
-     /usr/local/bin/
+    /out/telesrv-sfu \
+    /usr/local/bin/telesrv-sfu
 
 COPY deploy/docker/config/sfu.yaml \
-     /etc/telesrv/sfu.yaml
+    /etc/telesrv/sfu.yaml
+
+RUN chmod 0555 /usr/local/bin/telesrv-sfu \
+    && chgrp 0 /usr/local/bin/telesrv-sfu
 
 EXPOSE 2450
 EXPOSE 12399/udp
 EXPOSE 12400/udp
 
-CMD ["telesrv-sfu","--config","/etc/telesrv/sfu.yaml"]
+CMD ["telesrv-sfu", "--config", "/etc/telesrv/sfu.yaml"]
+
 
 ###############################################################################
 # ADMIN
@@ -370,15 +474,19 @@ CMD ["telesrv-sfu","--config","/etc/telesrv/sfu.yaml"]
 FROM runtime-base AS admin
 
 COPY --from=build-admin \
-     /out/telesrv-admin \
-     /usr/local/bin/
+    /out/telesrv-admin \
+    /usr/local/bin/telesrv-admin
 
 COPY deploy/docker/config/admin.yaml \
-     /etc/telesrv/admin.yaml
+    /etc/telesrv/admin.yaml
+
+RUN chmod 0555 /usr/local/bin/telesrv-admin \
+    && chgrp 0 /usr/local/bin/telesrv-admin
 
 EXPOSE 2600
 
-CMD ["telesrv-admin","--config","/etc/telesrv/admin.yaml"]
+CMD ["telesrv-admin", "--config", "/etc/telesrv/admin.yaml"]
+
 
 ###############################################################################
 # EDGE
@@ -389,24 +497,29 @@ FROM runtime-base AS edge
 USER 0
 
 RUN microdnf install -y openssl \
- && microdnf clean all
+    && microdnf clean all \
+    && rm -rf /var/cache/yum
 
 RUN mkdir -p /var/lib/telesrv-edge \
- && chgrp -R 0 /var/lib/telesrv-edge \
- && chmod -R g=u /var/lib/telesrv-edge
+    && chgrp -R 0 /var/lib/telesrv-edge \
+    && chmod -R g=u /var/lib/telesrv-edge
 
 COPY --from=build-edge \
-     /out/telesrv-edge \
-     /usr/local/bin/
+    /out/telesrv-edge \
+    /usr/local/bin/telesrv-edge
 
 COPY deploy/docker/config/edge.yaml \
-     /etc/telesrv/edge.yaml
+    /etc/telesrv/edge.yaml
+
+RUN chmod 0555 /usr/local/bin/telesrv-edge \
+    && chgrp 0 /usr/local/bin/telesrv-edge
 
 USER 1001
 
 EXPOSE 2398
 
-CMD ["telesrv-edge","--config","/etc/telesrv/edge.yaml"]
+CMD ["telesrv-edge", "--config", "/etc/telesrv/edge.yaml"]
+
 
 ###############################################################################
 # MIGRATION
@@ -415,10 +528,14 @@ CMD ["telesrv-edge","--config","/etc/telesrv/edge.yaml"]
 FROM runtime-base AS migrate
 
 COPY --from=build-migrate \
-     /out/telesrv-migrate \
-     /usr/local/bin/
+    /out/telesrv-migrate \
+    /usr/local/bin/telesrv-migrate
+
+RUN chmod 0555 /usr/local/bin/telesrv-migrate \
+    && chgrp 0 /usr/local/bin/telesrv-migrate
 
 CMD ["telesrv-migrate"]
+
 
 ###############################################################################
 # EDGE TEST
@@ -428,14 +545,17 @@ FROM edge AS edge-test
 
 USER 0
 
-RUN mkdir -p /usr/share/telesrv/keys
+RUN mkdir -p /usr/share/telesrv/keys \
+    && chgrp -R 0 /usr/share/telesrv/keys \
+    && chmod -R g=u /usr/share/telesrv/keys
 
 COPY deploy/docker/assets/test-server-rsa.pub \
-     /usr/share/telesrv/keys/test-server-rsa.pub
+    /usr/share/telesrv/keys/test-server-rsa.pub
 
 COPY deploy/docker/assets/test-server-rsa.pem.b64 \
-     /usr/share/telesrv/keys/test-server-rsa.pem.b64
+    /usr/share/telesrv/keys/test-server-rsa.pem.b64
 
-RUN chmod 0444 /usr/share/telesrv/keys/*
+RUN chmod 0444 /usr/share/telesrv/keys/* \
+    && chgrp 0 /usr/share/telesrv/keys/*
 
 USER 1001
